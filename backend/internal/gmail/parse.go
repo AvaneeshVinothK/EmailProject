@@ -11,6 +11,7 @@ import (
 	gmailapi "google.golang.org/api/gmail/v1"
 )
 
+// HeaderValue returns the normalized value for a named Gmail header, if present.
 func HeaderValue(headers []*gmailapi.MessagePartHeader, name string) string {
 	for _, h := range headers {
 		if strings.EqualFold(h.Name, name) {
@@ -20,6 +21,7 @@ func HeaderValue(headers []*gmailapi.MessagePartHeader, name string) string {
 	return ""
 }
 
+// ExtractMessageBody walks a Gmail message payload and returns the most useful readable body.
 func ExtractMessageBody(payload *gmailapi.MessagePart) string {
 	if payload == nil {
 		return ""
@@ -65,6 +67,7 @@ func ExtractMessageBody(payload *gmailapi.MessagePart) string {
 	return ""
 }
 
+// StripHTML removes HTML tags while preserving readable text content.
 func StripHTML(s string) string {
 	var b strings.Builder
 	inTag := false
@@ -85,6 +88,7 @@ func StripHTML(s string) string {
 	return strings.TrimSpace(text)
 }
 
+// DecodeGmailBody decodes base64url-encoded Gmail message body content into a plain string.
 func DecodeGmailBody(data string) string {
 	if strings.TrimSpace(data) == "" {
 		return ""
