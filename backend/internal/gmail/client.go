@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/googleapi"
 	gmailapi "google.golang.org/api/gmail/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -60,6 +59,7 @@ func NewService(ctx context.Context, oauthCfg *oauth2.Config, token *oauth2.Toke
 	}
 
 	client := oauth2.NewClient(ctx, tokenSource)
+	client.Transport = newThrottledTransport(client.Transport)
 	service, err := gmailapi.NewService(ctx, option.WithHTTPClient(client))
 	if err != nil {
 		return nil, fmt.Errorf("creating Gmail service: %w", err)
@@ -71,7 +71,7 @@ func NewService(ctx context.Context, oauthCfg *oauth2.Config, token *oauth2.Toke
 func GetProfile(ctx context.Context, svc *gmailapi.Service) (string, uint64, error) {
 	profile, err := svc.Users.GetProfile("me").Context(ctx).Do()
 	if err != nil {
-		return "", 0, fmt.Errorf("loading Gmail profile: %w", err)
+		return "", 0, wrapAPIError("loading Gmail profile", err)
 	}
 	return profile.EmailAddress, profile.HistoryId, nil
 }
@@ -80,7 +80,7 @@ func GetProfile(ctx context.Context, svc *gmailapi.Service) (string, uint64, err
 func ListMessageIDs(ctx context.Context, svc *gmailapi.Service, after time.Time) ([]string, error) {
 	query := fmt.Sprintf("in:inbox after:%d", after.Unix())
 	ids := make([]string, 0)
-	call := svc.Users.Messages.List("me").Q(query).Context(ctx)
+	call := svc.Users.Messages.List("me").Q(query).MaxResults(500).Context(ctx)
 	if err := call.Pages(ctx, func(resp *gmailapi.ListMessagesResponse) error {
 		for _, msg := range resp.Messages {
 			if msg != nil && msg.Id != "" {
@@ -89,7 +89,7 @@ func ListMessageIDs(ctx context.Context, svc *gmailapi.Service, after time.Time)
 		}
 		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("listing Gmail messages: %w", err)
+		return nil, wrapAPIError("listing Gmail messages", err)
 	}
 	return ids, nil
 }
@@ -109,15 +109,21 @@ func ListHistory(ctx context.Context, svc *gmailapi.Service, startHistoryID uint
 		Context(ctx)
 
 	err := call.Pages(ctx, func(resp *gmailapi.ListHistoryResponse) error {
+		if resp == nil {
+			return nil
+		}
+		if resp.HistoryId > newestHistoryID {
+			newestHistoryID = resp.HistoryId
+		}
 		for _, history := range resp.History {
 			if history == nil {
 				continue
 			}
-			if history.Id > newestHistoryID {
-				newestHistoryID = history.Id
-			}
 			for _, added := range history.MessagesAdded {
 				if added == nil || added.Message == nil || added.Message.Id == "" {
+					continue
+				}
+				if !hasInboxLabelID(added.Message.LabelIds) {
 					continue
 				}
 				if _, ok := seen[added.Message.Id]; !ok {
@@ -145,7 +151,7 @@ func ListHistory(ctx context.Context, svc *gmailapi.Service, startHistoryID uint
 		if errors.As(err, &gerr) && gerr.Code == httpStatusNotFound {
 			return nil, 0, ErrHistoryExpired
 		}
-		return nil, 0, fmt.Errorf("listing Gmail history: %w", err)
+		return nil, 0, wrapAPIError("listing Gmail history", err)
 	}
 	if newestHistoryID == 0 {
 		newestHistoryID = startHistoryID
@@ -161,17 +167,17 @@ func GetMessage(ctx context.Context, svc *gmailapi.Service, id string) (models.E
 		if errors.As(err, &gerr) && gerr.Code == httpStatusNotFound {
 			return models.Email{}, ErrMessageNotFound
 		}
-		return models.Email{}, fmt.Errorf("loading Gmail message %s: %w", id, err)
+		return models.Email{}, wrapAPIError(fmt.Sprintf("loading Gmail message %s", id), err)
 	}
 
 	email := models.Email{
 		GmailMessageID: id,
-		Sender:         HeaderValue(msg.Payload.Headers, "From"),
-		Subject:        HeaderValue(msg.Payload.Headers, "Subject"),
 		Body:           "",
 		ReceivedAt:     time.UnixMilli(msg.InternalDate),
 	}
 	if msg != nil && msg.Payload != nil {
+		email.Sender = HeaderValue(msg.Payload.Headers, "From")
+		email.Subject = HeaderValue(msg.Payload.Headers, "Subject")
 		email.Body = ExtractMessageBody(msg.Payload)
 	}
 	return email, nil
@@ -187,7 +193,3 @@ func hasInboxLabelID(labelIDs []string) bool {
 }
 
 const httpStatusNotFound = 404
-
-func init() {
-	log.SetFlags(0)
-}
