@@ -118,8 +118,8 @@ func TestSync_UpsertFailurePreventsCursorAdvance(t *testing.T) {
 	account := models.EmailAccount{ID: 8, EmailAddress: "user@example.com"}
 
 	res, err := Sync(ctx, mail, store, account)
-	if err != nil {
-		t.Fatalf("Sync() returned error: %v", err)
+	if err == nil || err.Error() != "1 messages failed; cursor not advanced" {
+		t.Fatalf("Sync() error = %v, want %q", err, "1 messages failed; cursor not advanced")
 	}
 	if res.Inserted != 0 {
 		t.Fatalf("result.Inserted = %d, want 0", res.Inserted)
@@ -129,6 +129,9 @@ func TestSync_UpsertFailurePreventsCursorAdvance(t *testing.T) {
 	}
 	if len(res.NewEmailIDs) != 0 {
 		t.Fatalf("result.NewEmailIDs = %v, want empty", res.NewEmailIDs)
+	}
+	if res.Failed != 1 {
+		t.Fatalf("result.Failed = %d, want 1", res.Failed)
 	}
 }
 
@@ -155,6 +158,54 @@ func TestSync_KnownIdsAreNotFetchedAndMessageNotFoundIsSkipped(t *testing.T) {
 	}
 	if res.Skipped != 1 || res.Inserted != 1 {
 		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestSyncIncremental_RateLimitedStopsAndLeavesCursorUnchanged(t *testing.T) {
+	ctx := context.Background()
+	mail := &fakeMailClient{
+		historyForStart: map[uint64][]string{55: {"m1", "m2"}},
+		msgErrs:         map[string]error{"m1": gmail.ErrRateLimited},
+		messages: map[string]models.Email{
+			"m2": {GmailMessageID: "m2", Sender: "b@example.com", Subject: "later", Body: "body2", ReceivedAt: time.Now()},
+		},
+	}
+	store := &fakeStore{existing: map[string]bool{}}
+	account := models.EmailAccount{ID: 22, EmailAddress: "user@example.com", LastHistoryID: strPtr("55"), BackfillCompletedAt: timePtr(time.Now())}
+
+	res, err := syncIncremental(ctx, mail, store, account)
+	if !errors.Is(err, gmail.ErrRateLimited) {
+		t.Fatalf("syncIncremental() error = %v, want ErrRateLimited", err)
+	}
+	if mail.getMessageCalls["m2"] {
+		t.Fatalf("GetMessage called for later id after rate limit; calls = %+v", mail.getMessageCalls)
+	}
+	if store.lastHistoryID != "" {
+		t.Fatalf("cursor after rate limit = %q, want empty", store.lastHistoryID)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("result.Failed = %d, want 0", res.Failed)
+	}
+}
+
+func TestSyncIncremental_OrdinaryFailureSetsFailedAndLeavesCursorUnchanged(t *testing.T) {
+	ctx := context.Background()
+	mail := &fakeMailClient{
+		historyForStart: map[uint64][]string{10: {"m1"}},
+		msgErrs:         map[string]error{"m1": errors.New("boom")},
+	}
+	store := &fakeStore{existing: map[string]bool{}}
+	account := models.EmailAccount{ID: 9, EmailAddress: "user@example.com", LastHistoryID: strPtr("10"), BackfillCompletedAt: timePtr(time.Now())}
+
+	res, err := syncIncremental(ctx, mail, store, account)
+	if err == nil || err.Error() != "1 messages failed; cursor not advanced" {
+		t.Fatalf("syncIncremental() error = %v, want %q", err, "1 messages failed; cursor not advanced")
+	}
+	if res.Failed != 1 {
+		t.Fatalf("result.Failed = %d, want 1", res.Failed)
+	}
+	if store.lastHistoryID != "" {
+		t.Fatalf("cursor after ordinary failure = %q, want empty", store.lastHistoryID)
 	}
 }
 

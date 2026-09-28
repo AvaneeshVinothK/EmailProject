@@ -20,6 +20,7 @@ type Result struct {
 	AlreadyKnown int
 	Fetched      int
 	Inserted     int
+	Failed       int
 	Skipped      int
 	NewEmailIDs  []int
 }
@@ -75,49 +76,14 @@ func syncBackfill(ctx context.Context, mail MailClient, store Store, account mod
 	}
 	result.Listed = len(ids)
 
-	known, err := store.ExistingMessageIDs(ctx, account.ID, ids)
-	if err != nil {
-		return result, fmt.Errorf("finding known messages: %w", err)
+	if err := processIDs(ctx, mail, store, account.ID, ids, &result); err != nil {
+		return result, err
 	}
-
-	unexpectedFailure := false
-	for _, id := range ids {
-		if known[id] {
-			result.AlreadyKnown++
-			continue
-		}
-
-		email, err := mail.GetMessage(ctx, id)
-		if errors.Is(err, gmail.ErrMessageNotFound) {
-			result.Skipped++
-			continue
-		}
-		if err != nil {
-			log.Printf("message %s fetch failed during backfill: %v", id, err)
-			unexpectedFailure = true
-			continue
-		}
-		result.Fetched++
-		email.EmailAccountID = account.ID
-
-		newID, inserted, err := store.UpsertEmail(ctx, email)
-		if err != nil {
-			log.Printf("message %s insert failed during backfill: %v", id, err)
-			unexpectedFailure = true
-			continue
-		}
-		if inserted {
-			result.Inserted++
-			result.NewEmailIDs = append(result.NewEmailIDs, newID)
-			continue
-		}
-		result.AlreadyKnown++
+	if result.Failed > 0 {
+		return result, fmt.Errorf("%d messages failed; cursor not advanced", result.Failed)
 	}
-
-	if !unexpectedFailure {
-		if err := store.UpdateSyncState(ctx, account.ID, strconv.FormatUint(historyID, 10), true); err != nil {
-			return result, fmt.Errorf("updating sync state after backfill: %w", err)
-		}
+	if err := store.UpdateSyncState(ctx, account.ID, strconv.FormatUint(historyID, 10), true); err != nil {
+		return result, fmt.Errorf("updating sync state after backfill: %w", err)
 	}
 
 	return result, nil
@@ -138,13 +104,33 @@ func syncIncremental(ctx context.Context, mail MailClient, store Store, account 
 	}
 	result.Listed = len(ids)
 
-	known, err := store.ExistingMessageIDs(ctx, account.ID, ids)
-	if err != nil {
-		return result, fmt.Errorf("finding known messages: %w", err)
+	if err := processIDs(ctx, mail, store, account.ID, ids, &result); err != nil {
+		return result, err
+	}
+	if result.Failed > 0 {
+		return result, fmt.Errorf("%d messages failed; cursor not advanced", result.Failed)
+	}
+	cursor := *account.LastHistoryID
+	if newestHistoryID != 0 {
+		cursor = strconv.FormatUint(newestHistoryID, 10)
+	}
+	if err := store.UpdateSyncState(ctx, account.ID, cursor, false); err != nil {
+		return result, fmt.Errorf("updating incremental sync state: %w", err)
 	}
 
-	unexpectedFailure := false
+	return result, nil
+}
+
+func processIDs(ctx context.Context, mail MailClient, store Store, accountID int, ids []string, result *Result) error {
+	known, err := store.ExistingMessageIDs(ctx, accountID, ids)
+	if err != nil {
+		return fmt.Errorf("finding known messages: %w", err)
+	}
+
 	for _, id := range ids {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if known[id] {
 			result.AlreadyKnown++
 			continue
@@ -155,18 +141,21 @@ func syncIncremental(ctx context.Context, mail MailClient, store Store, account 
 			result.Skipped++
 			continue
 		}
+		if errors.Is(err, gmail.ErrRateLimited) {
+			return err
+		}
 		if err != nil {
-			log.Printf("message %s fetch failed during incremental sync: %v", id, err)
-			unexpectedFailure = true
+			log.Printf("message %s fetch failed during sync: %v", id, err)
+			result.Failed++
 			continue
 		}
 		result.Fetched++
-		email.EmailAccountID = account.ID
+		email.EmailAccountID = accountID
 
 		newID, inserted, err := store.UpsertEmail(ctx, email)
 		if err != nil {
-			log.Printf("message %s insert failed during incremental sync: %v", id, err)
-			unexpectedFailure = true
+			log.Printf("message %s insert failed during sync: %v", id, err)
+			result.Failed++
 			continue
 		}
 		if inserted {
@@ -176,16 +165,5 @@ func syncIncremental(ctx context.Context, mail MailClient, store Store, account 
 		}
 		result.AlreadyKnown++
 	}
-
-	if !unexpectedFailure {
-		cursor := *account.LastHistoryID
-		if newestHistoryID != 0 {
-			cursor = strconv.FormatUint(newestHistoryID, 10)
-		}
-		if err := store.UpdateSyncState(ctx, account.ID, cursor, false); err != nil {
-			return result, fmt.Errorf("updating incremental sync state: %w", err)
-		}
-	}
-
-	return result, nil
+	return nil
 }
