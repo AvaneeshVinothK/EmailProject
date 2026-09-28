@@ -11,10 +11,12 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// GoogleCredentialsFile is the top-level JSON structure in the Google OAuth credentials file.
 type GoogleCredentialsFile struct {
 	Web GoogleCredentials `json:"web"`
 }
 
+// GoogleCredentials contains the OAuth client settings Google emits for a web app.
 type GoogleCredentials struct {
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
@@ -23,12 +25,14 @@ type GoogleCredentials struct {
 	RedirectURIs []string `json:"redirect_uris"`
 }
 
+// LoadedGoogleConfig is the runtime-usable subset of OAuth client settings.
 type LoadedGoogleConfig struct {
 	ClientID     string
 	ClientSecret string
 	RedirectURL  string
 }
 
+// ProjectRoot finds the directory containing the local Google credentials file.
 func ProjectRoot() string {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -55,14 +59,17 @@ func projectFilePath(name string) string {
 	return filepath.Join(root, name)
 }
 
+// GoogleCredentialsPath returns the location of the Google OAuth client credentials file.
 func GoogleCredentialsPath() string {
 	return projectFilePath("google_credentials.json")
 }
 
+// TokenPath returns the location of the serialized OAuth token for the current project.
 func TokenPath() string {
 	return projectFilePath("token.json")
 }
 
+// LoadGoogleConfig reads the OAuth client config from env vars or the local credentials file.
 func LoadGoogleConfig() (*LoadedGoogleConfig, error) {
 	if clientID := os.Getenv("GOOGLE_CLIENT_ID"); clientID != "" {
 		return &LoadedGoogleConfig{
@@ -116,6 +123,7 @@ func LoadGoogleConfig() (*LoadedGoogleConfig, error) {
 	return nil, errors.New("no google credentials file found")
 }
 
+// LoadToken reads the previously saved OAuth token from disk.
 func LoadToken(tokenPath string) (*oauth2.Token, error) {
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
@@ -129,6 +137,7 @@ func LoadToken(tokenPath string) (*oauth2.Token, error) {
 	return &token, nil
 }
 
+// SaveToken writes the refreshed OAuth token to disk so future runs can reuse it.
 func SaveToken(tokenPath string, token *oauth2.Token) error {
 	data, err := json.MarshalIndent(token, "", "  ")
 	if err != nil {

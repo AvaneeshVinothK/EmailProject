@@ -2,80 +2,91 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"net/http"
+	"time"
 
+	"github.com/AvaneeshVinothK/EmailProject/internal/db"
 	"github.com/AvaneeshVinothK/EmailProject/internal/gmail"
-	"golang.org/x/oauth2"
+	"github.com/AvaneeshVinothK/EmailProject/internal/models"
+	"github.com/AvaneeshVinothK/EmailProject/internal/sync"
+	"github.com/joho/godotenv"
+	gmailapi "google.golang.org/api/gmail/v1"
 )
 
-const (
-	defaultPort = ":8080"
-)
-
+// main bootstraps the Gmail sync flow for the connected account and runs the sync orchestration.
 func main() {
+	if err := godotenv.Load("../../../.env"); err != nil {
+		log.Printf("dotenv not loaded: %v", err)
+	}
+
 	ctx := context.Background()
+	pool, err := db.Connect(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
+
 	cfg, err := gmail.LoadGoogleConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	config := gmail.NewOAuthConfig(cfg, cfg.RedirectURL)
 	tokenPath := gmail.TokenPath()
-
-	if token, err := gmail.LoadToken(tokenPath); err == nil && token.Valid() {
-		log.Println("Using saved Google token from token.json")
-		if err := gmail.FetchRecentMessages(ctx, config, token); err != nil {
-			log.Printf("Gmail fetch failed: %v", err)
-		}
+	token, err := gmail.LoadToken(tokenPath)
+	if err != nil {
+		log.Fatal("run cmd/auth first")
+	}
+	if token.RefreshToken == "" && token.AccessToken == "" {
+		log.Fatal("run cmd/auth first")
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if token, err := gmail.LoadToken(tokenPath); err == nil && token.Valid() {
-			fmt.Fprintln(w, "Already authenticated using saved token. Refreshing Gmail messages...")
-			if err := gmail.FetchRecentMessages(ctx, config, token); err != nil {
-				fmt.Fprintf(w, "Gmail fetch failed: %v\n", err)
-			}
-			return
-		}
+	config := gmail.NewOAuthConfig(cfg, cfg.RedirectURL)
+	service, err := gmail.NewService(ctx, config, token)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		url := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline, oauth2.ApprovalForce)
-		fmt.Fprintf(w, "<html><body><a href=\"%s\">Sign in with Google</a></body></html>", url)
-	})
+	emailAddr, _, err := gmail.GetProfile(ctx, service)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "invalid callback request", http.StatusBadRequest)
-			return
-		}
+	store := db.NewStore(pool)
+	userID, err := store.GetOrCreateUser(ctx, emailAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		code := r.FormValue("code")
-		if code == "" {
-			http.Error(w, "missing authorization code", http.StatusBadRequest)
-			return
-		}
+	account, err := store.GetOrCreateEmailAccount(ctx, userID, emailAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		token, err := config.Exchange(ctx, code)
-		if err != nil {
-			http.Error(w, "failed to exchange code for token: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+	result, err := sync.Sync(ctx, gmailSyncClient{service: service}, store, account)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		if err := gmail.SaveToken(tokenPath, token); err != nil {
-			http.Error(w, "failed to save token: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+	log.Printf("sync result: listed=%d alreadyKnown=%d fetched=%d inserted=%d skipped=%d new_ids=%v", result.Listed, result.AlreadyKnown, result.Fetched, result.Inserted, result.Skipped, result.NewEmailIDs)
+}
 
-		if err := gmail.FetchRecentMessages(ctx, config, token); err != nil {
-			http.Error(w, "failed to fetch Gmail messages: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+// gmailSyncClient adapts the Gmail API client to the sync.MailClient interface.
+type gmailSyncClient struct {
+	service *gmailapi.Service
+}
 
-		fmt.Fprintf(w, "Google login successful. Token saved to %s", tokenPath)
-	})
+func (g gmailSyncClient) GetProfile(ctx context.Context) (string, uint64, error) {
+	return gmail.GetProfile(ctx, g.service)
+}
 
-	log.Printf("Google OAuth example running at http://localhost%s", defaultPort)
-	log.Fatal(http.ListenAndServe(defaultPort, mux))
+func (g gmailSyncClient) ListMessageIDs(ctx context.Context, after time.Time) ([]string, error) {
+	return gmail.ListMessageIDs(ctx, g.service, after)
+}
+
+func (g gmailSyncClient) ListHistory(ctx context.Context, startHistoryID uint64) ([]string, uint64, error) {
+	return gmail.ListHistory(ctx, g.service, startHistoryID)
+}
+
+func (g gmailSyncClient) GetMessage(ctx context.Context, id string) (models.Email, error) {
+	return gmail.GetMessage(ctx, g.service, id)
 }

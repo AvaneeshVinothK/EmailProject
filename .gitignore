@@ -1,6 +1,9 @@
+# Environment Variables
+.env
+
 # OAuth
 google_credentials.json
 token.json
 
-# File types
+# File Types
 *.exe

@@ -2,15 +2,26 @@ package gmail
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
+	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	gmailapi "google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 )
 
+// ErrHistoryExpired means Gmail's history cursor is stale and must be reset via backfill.
+var ErrHistoryExpired = errors.New("gmail history expired")
+
+// ErrMessageNotFound means the message was deleted or no longer available from Gmail.
+var ErrMessageNotFound = errors.New("gmail message not found")
+
+// NewOAuthConfig builds the OAuth client config for Gmail API access.
 func NewOAuthConfig(cfg *LoadedGoogleConfig, redirectURL string) *oauth2.Config {
 	if redirectURL == "" {
 		redirectURL = "http://localhost:8080/oauth/callback"
@@ -30,57 +41,153 @@ func NewOAuthConfig(cfg *LoadedGoogleConfig, redirectURL string) *oauth2.Config 
 	}
 }
 
-func FetchRecentMessages(ctx context.Context, cfg *oauth2.Config, token *oauth2.Token) error {
-	tokenSource := cfg.TokenSource(ctx, token)
+// NewService creates a Gmail API client using the provided OAuth configuration and token.
+func NewService(ctx context.Context, oauthCfg *oauth2.Config, token *oauth2.Token) (*gmailapi.Service, error) {
+	if oauthCfg == nil {
+		return nil, errors.New("oauth config is nil")
+	}
+	if token == nil {
+		return nil, errors.New("oauth token is nil")
+	}
+
+	tokenSource := oauthCfg.TokenSource(ctx, token)
 	refreshedToken, err := tokenSource.Token()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("refreshing Gmail token: %w", err)
 	}
 	if refreshedToken != nil && refreshedToken.AccessToken != "" {
 		token = refreshedToken
-		if err := SaveToken(TokenPath(), token); err != nil {
-			log.Printf("warning: failed to persist refreshed token: %v", err)
-		}
 	}
 
 	client := oauth2.NewClient(ctx, tokenSource)
 	service, err := gmailapi.NewService(ctx, option.WithHTTPClient(client))
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("creating Gmail service: %w", err)
 	}
+	return service, nil
+}
 
-	profile, err := service.Users.GetProfile("me").Do()
+// GetProfile loads the signed-in account email and the current Gmail history ID.
+func GetProfile(ctx context.Context, svc *gmailapi.Service) (string, uint64, error) {
+	profile, err := svc.Users.GetProfile("me").Context(ctx).Do()
 	if err != nil {
-		return fmt.Errorf("failed to load Gmail profile: %w", err)
+		return "", 0, fmt.Errorf("loading Gmail profile: %w", err)
 	}
-	fmt.Printf("Authenticated Gmail account: %s\n", profile.EmailAddress)
+	return profile.EmailAddress, profile.HistoryId, nil
+}
 
-	list, err := service.Users.Messages.List("me").
-		LabelIds("INBOX").
-		Q("in:inbox newer_than:30d").
-		MaxResults(20).
-		Do()
-	if err != nil {
-		return fmt.Errorf("failed to list Gmail messages: %w", err)
-	}
-	if len(list.Messages) == 0 {
-		fmt.Println("No recent messages found in INBOX for the authenticated Gmail account in the last 30 days.")
-		return nil
-	}
-
-	for _, msgRef := range list.Messages {
-		msg, err := service.Users.Messages.Get("me", msgRef.Id).Format("full").Do()
-		if err != nil {
-			log.Printf("message %s failed: %v", msgRef.Id, err)
-			continue
+// ListMessageIDs returns all message IDs for inbox messages newer than the cutoff time.
+func ListMessageIDs(ctx context.Context, svc *gmailapi.Service, after time.Time) ([]string, error) {
+	query := fmt.Sprintf("in:inbox after:%d", after.Unix())
+	ids := make([]string, 0)
+	call := svc.Users.Messages.List("me").Q(query).Context(ctx)
+	if err := call.Pages(ctx, func(resp *gmailapi.ListMessagesResponse) error {
+		for _, msg := range resp.Messages {
+			if msg != nil && msg.Id != "" {
+				ids = append(ids, msg.Id)
+			}
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("listing Gmail messages: %w", err)
+	}
+	return ids, nil
+}
 
-		subject := HeaderValue(msg.Payload.Headers, "Subject")
-		sender := HeaderValue(msg.Payload.Headers, "From")
-		body := ExtractMessageBody(msg.Payload)
-
-		fmt.Printf("\nMessage ID: %s\nSubject: %s\nFrom: %s\nBody:\n%s\n---\n", msgRef.Id, subject, sender, body)
+// ListHistory fetches the change set since a Gmail history cursor and returns the newest cursor.
+func ListHistory(ctx context.Context, svc *gmailapi.Service, startHistoryID uint64) ([]string, uint64, error) {
+	if svc == nil {
+		return nil, startHistoryID, errors.New("gmail service is nil")
 	}
 
-	return nil
+	seen := map[string]struct{}{}
+	ids := make([]string, 0)
+	newestHistoryID := startHistoryID
+	call := svc.Users.History.List("me").
+		StartHistoryId(startHistoryID).
+		HistoryTypes("messageAdded", "labelAdded").
+		Context(ctx)
+
+	err := call.Pages(ctx, func(resp *gmailapi.ListHistoryResponse) error {
+		for _, history := range resp.History {
+			if history == nil {
+				continue
+			}
+			if history.Id > newestHistoryID {
+				newestHistoryID = history.Id
+			}
+			for _, added := range history.MessagesAdded {
+				if added == nil || added.Message == nil || added.Message.Id == "" {
+					continue
+				}
+				if _, ok := seen[added.Message.Id]; !ok {
+					seen[added.Message.Id] = struct{}{}
+					ids = append(ids, added.Message.Id)
+				}
+			}
+			for _, labelAdded := range history.LabelsAdded {
+				if labelAdded == nil || labelAdded.Message == nil || labelAdded.Message.Id == "" {
+					continue
+				}
+				if !hasInboxLabelID(labelAdded.LabelIds) {
+					continue
+				}
+				if _, ok := seen[labelAdded.Message.Id]; !ok {
+					seen[labelAdded.Message.Id] = struct{}{}
+					ids = append(ids, labelAdded.Message.Id)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		var gerr *googleapi.Error
+		if errors.As(err, &gerr) && gerr.Code == httpStatusNotFound {
+			return nil, 0, ErrHistoryExpired
+		}
+		return nil, 0, fmt.Errorf("listing Gmail history: %w", err)
+	}
+	if newestHistoryID == 0 {
+		newestHistoryID = startHistoryID
+	}
+	return ids, newestHistoryID, nil
+}
+
+// GetMessage retrieves one message body and headers and normalizes it into the app model.
+func GetMessage(ctx context.Context, svc *gmailapi.Service, id string) (models.Email, error) {
+	msg, err := svc.Users.Messages.Get("me", id).Format("full").Context(ctx).Do()
+	if err != nil {
+		var gerr *googleapi.Error
+		if errors.As(err, &gerr) && gerr.Code == httpStatusNotFound {
+			return models.Email{}, ErrMessageNotFound
+		}
+		return models.Email{}, fmt.Errorf("loading Gmail message %s: %w", id, err)
+	}
+
+	email := models.Email{
+		GmailMessageID: id,
+		Sender:         HeaderValue(msg.Payload.Headers, "From"),
+		Subject:        HeaderValue(msg.Payload.Headers, "Subject"),
+		Body:           "",
+		ReceivedAt:     time.UnixMilli(msg.InternalDate),
+	}
+	if msg != nil && msg.Payload != nil {
+		email.Body = ExtractMessageBody(msg.Payload)
+	}
+	return email, nil
+}
+
+func hasInboxLabelID(labelIDs []string) bool {
+	for _, id := range labelIDs {
+		if id == "INBOX" {
+			return true
+		}
+	}
+	return false
+}
+
+const httpStatusNotFound = 404
+
+func init() {
+	log.SetFlags(0)
 }
