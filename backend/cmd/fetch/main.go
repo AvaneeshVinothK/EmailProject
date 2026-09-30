@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
+	"github.com/AvaneeshVinothK/EmailProject/internal/classifier"
 	"github.com/AvaneeshVinothK/EmailProject/internal/db"
 	"github.com/AvaneeshVinothK/EmailProject/internal/gmail"
 	"github.com/AvaneeshVinothK/EmailProject/internal/models"
@@ -68,6 +70,90 @@ func main() {
 	}
 
 	log.Printf("sync result: listed=%d alreadyKnown=%d fetched=%d inserted=%d skipped=%d new_ids=%v", result.Listed, result.AlreadyKnown, result.Fetched, result.Inserted, result.Skipped, result.NewEmailIDs)
+
+	idsToClassify := make([]int, 0, len(result.NewEmailIDs))
+	seen := map[int]bool{}
+	for _, id := range result.NewEmailIDs {
+		if !seen[id] {
+			idsToClassify = append(idsToClassify, id)
+			seen[id] = true
+		}
+	}
+
+	unclassified, err := store.GetUnclassifiedEmailIDs(ctx, account.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, id := range unclassified {
+		if !seen[id] {
+			idsToClassify = append(idsToClassify, id)
+			seen[id] = true
+		}
+	}
+
+	if len(idsToClassify) == 0 {
+		log.Println("classification skipped: no eligible emails to classify")
+		return
+	}
+
+	gemini, err := classifier.New(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	categoryRows, err := store.GetCategories(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	categories := make([]classifier.Category, 0, len(categoryRows))
+	for _, category := range categoryRows {
+		// Description will be populated once user-defined categories exist in the schema.
+		categories = append(categories, classifier.Category{Name: category.Name})
+	}
+
+	successCount := 0
+	failedCount := 0
+	for _, id := range idsToClassify {
+		email, err := store.GetEmailByID(ctx, id)
+		if err != nil {
+			log.Printf("classification failed for email id %d: %v", id, err)
+			failedCount++
+			continue
+		}
+
+		res, err := gemini.Classify(ctx, email.Subject, email.Sender, email.Body, categories)
+		if err != nil {
+			if errors.Is(err, classifier.ErrDailyQuotaExhausted) {
+				log.Printf("classification daily quota exhausted; stopping for this run: %v", err)
+				break
+			}
+			log.Printf("classification failed for email id %d (%s): %v", id, email.Subject, err)
+			failedCount++
+			continue
+		}
+
+		var categoryID int
+		for _, category := range categoryRows {
+			if category.Name == res.Category {
+				categoryID = category.ID
+				break
+			}
+		}
+		if categoryID == 0 {
+			log.Printf("classification failed for email id %d: no matching DB category for %q", id, res.Category)
+			failedCount++
+			continue
+		}
+
+		if err := store.UpsertClassification(ctx, id, categoryID, res.Confidence, classifier.ModelVersion()); err != nil {
+			log.Printf("saving classification for email id %d: %v", id, err)
+			failedCount++
+			continue
+		}
+		successCount++
+	}
+
+	log.Printf("classification result: total=%d successful=%d failed=%d", len(idsToClassify), successCount, failedCount)
 }
 
 // gmailSyncClient adapts the Gmail API client to the sync.MailClient interface.

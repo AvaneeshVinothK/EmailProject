@@ -12,7 +12,7 @@ import (
 	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 )
 
-const backfillWindowDays = 60
+const backfillWindowDays = 3
 
 // Result summarizes the outcome of a sync attempt for one account.
 type Result struct {

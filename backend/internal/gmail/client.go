@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AvaneeshVinothK/EmailProject/internal/models"
+	"github.com/AvaneeshVinothK/EmailProject/internal/throttle"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	gmailapi "google.golang.org/api/gmail/v1"
@@ -59,7 +60,7 @@ func NewService(ctx context.Context, oauthCfg *oauth2.Config, token *oauth2.Toke
 	}
 
 	client := oauth2.NewClient(ctx, tokenSource)
-	client.Transport = newThrottledTransport(client.Transport)
+	client.Transport = throttle.New(client.Transport, 10, 1, gmailClassify)
 	service, err := gmailapi.NewService(ctx, option.WithHTTPClient(client))
 	if err != nil {
 		return nil, fmt.Errorf("creating Gmail service: %w", err)

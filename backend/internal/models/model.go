@@ -32,6 +32,12 @@ type Email struct {
 	ReceivedAt     time.Time `json:"received_at"`
 }
 
+// Category represents a persisted job-search classification bucket.
+type Category struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
 // CategoryName identifies the classification bucket assigned to an email.
 type CategoryName string
 
