@@ -32,17 +32,19 @@ type Email struct {
 	ReceivedAt     time.Time `json:"received_at"`
 }
 
-// Category represents a persisted job-search classification bucket.
+// Category represents a persisted job-search classification bucket and the description
+// used to guide the classifier toward it.
 type Category struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // CategoryName identifies the classification bucket assigned to an email.
 type CategoryName string
 
 const (
-	// CategoryConfirmation covers confirmation and scheduling emails.
+	// CategoryConfirmation covers automated application-received confirmations.
 	CategoryConfirmation CategoryName = "confirmation"
 	// CategoryNextSteps covers actionable follow-up messages.
 	CategoryNextSteps CategoryName = "next_steps"
@@ -52,4 +54,6 @@ const (
 	CategoryOnlineAssessment CategoryName = "online_assessment"
 	// CategoryInterview covers interview invitations and interview-related updates.
 	CategoryInterview CategoryName = "interview"
+	// CategoryOther is the fallback for emails that do not clearly fit any other category.
+	CategoryOther CategoryName = "other"
 )
