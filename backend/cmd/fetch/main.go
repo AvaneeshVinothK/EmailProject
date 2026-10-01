@@ -105,11 +105,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	categories := make([]classifier.Category, 0, len(categoryRows))
-	for _, category := range categoryRows {
-		// Description will be populated once user-defined categories exist in the schema.
-		categories = append(categories, classifier.Category{Name: category.Name})
-	}
+	categories := classifier.CategoriesFromModels(categoryRows)
 
 	successCount := 0
 	failedCount := 0

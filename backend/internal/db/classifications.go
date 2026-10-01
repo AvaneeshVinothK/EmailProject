@@ -7,10 +7,10 @@ import (
 	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 )
 
-// GetCategories returns the configured category names ordered by database id.
+// GetCategories returns the configured categories and their descriptions ordered by database id.
 func (s *Store) GetCategories(ctx context.Context) ([]models.Category, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name
+		SELECT id, name, description
 		FROM categories
 		ORDER BY id
 	`)
@@ -22,7 +22,7 @@ func (s *Store) GetCategories(ctx context.Context) ([]models.Category, error) {
 	categories := make([]models.Category, 0)
 	for rows.Next() {
 		var category models.Category
-		if err := rows.Scan(&category.ID, &category.Name); err != nil {
+		if err := rows.Scan(&category.ID, &category.Name, &category.Description); err != nil {
 			return nil, fmt.Errorf("scanning category row: %w", err)
 		}
 		categories = append(categories, category)

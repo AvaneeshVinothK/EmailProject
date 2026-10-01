@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 	"github.com/AvaneeshVinothK/EmailProject/internal/throttle"
 )
 
@@ -27,10 +28,23 @@ var cerebrasAPIURL = "https://api.cerebras.ai/v1/chat/completions"
 
 var ErrDailyQuotaExhausted = errors.New("classifier: daily quota exhausted")
 
+// ErrMissingOtherCategory is returned when the categories passed to Classify do not include
+// the required "other" fallback category.
+var ErrMissingOtherCategory = errors.New(`classifier: categories must include "other"`)
+
 // Category represents a job-search classification bucket and its explanatory description.
 type Category struct {
 	Name        string
 	Description string
+}
+
+// CategoriesFromModels converts persisted categories into classifier categories, keeping descriptions.
+func CategoriesFromModels(rows []models.Category) []Category {
+	categories := make([]Category, 0, len(rows))
+	for _, row := range rows {
+		categories = append(categories, Category{Name: row.Name, Description: row.Description})
+	}
+	return categories
 }
 
 // Result is the structured classification decision returned by the model.
@@ -80,6 +94,9 @@ func (c *Classifier) Classify(ctx context.Context, subject, sender, body string,
 	}
 	if len(categories) == 0 {
 		return Result{}, fmt.Errorf("classifying email: %w", errors.New("no categories provided"))
+	}
+	if !hasCategory(categories, string(models.CategoryOther)) {
+		return Result{}, fmt.Errorf("classifying email: %w", ErrMissingOtherCategory)
 	}
 
 	prompt := buildPrompt(subject, sender, body, categories)
@@ -208,10 +225,16 @@ func isDailyQuotaExhausted(body string) bool {
 func buildPrompt(subject, sender, body string, categories []Category) string {
 	var b strings.Builder
 	b.WriteString("Classify this email for a job-search workflow. Return the single best category and confidence between 0 and 1.\n")
-	b.WriteString("If no category is a strong fit, choose the closest category anyway with a lower confidence value.\n\n")
+	b.WriteString("Use each category's description to decide which one fits.\n")
+	b.WriteString(fmt.Sprintf("If the email does not clearly fit any other category, choose %q.\n\n", models.CategoryOther))
 	b.WriteString("Available categories:\n")
 	for _, category := range categories {
-		b.WriteString(fmt.Sprintf("- %s: %s\n", category.Name, category.Description))
+		description := strings.TrimSpace(category.Description)
+		if description == "" {
+			b.WriteString(fmt.Sprintf("- %s\n", category.Name))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("- %s: %s\n", category.Name, description))
 	}
 	b.WriteString("\n")
 	b.WriteString("Subject: ")
@@ -222,6 +245,15 @@ func buildPrompt(subject, sender, body string, categories []Category) string {
 	b.WriteString("\n\nEmail body:\n")
 	b.WriteString(truncate(body, 3000))
 	return b.String()
+}
+
+func hasCategory(categories []Category, name string) bool {
+	for _, category := range categories {
+		if category.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

@@ -3,6 +3,7 @@ package classifier
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AvaneeshVinothK/EmailProject/internal/models"
 	"github.com/AvaneeshVinothK/EmailProject/internal/throttle"
 )
 
@@ -61,7 +63,7 @@ func TestClassifier_ClassifySuccess(t *testing.T) {
 		t.Fatalf("New() returned error: %v", err)
 	}
 
-	result, err := c.Classify(context.Background(), "Subject", "sender@example.com", "Hello there", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	result, err := c.Classify(context.Background(), "Subject", "sender@example.com", "Hello there", []Category{{Name: "next_steps", Description: "Follow-up"}, {Name: "other", Description: "Everything else"}})
 	if err != nil {
 		t.Fatalf("Classify() returned error: %v", err)
 	}
@@ -89,7 +91,7 @@ func TestClassifier_ClassifyRejectsCategoryNotInList(t *testing.T) {
 		t.Fatalf("New() returned error: %v", err)
 	}
 
-	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}, {Name: "other", Description: "Everything else"}})
 	if err == nil || !strings.Contains(err.Error(), "invalid category") {
 		t.Fatalf("Classify() error = %v, want invalid category error", err)
 	}
@@ -111,7 +113,7 @@ func TestClassifier_ClassifyRejectsEmptyContent(t *testing.T) {
 		t.Fatalf("New() returned error: %v", err)
 	}
 
-	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}, {Name: "other", Description: "Everything else"}})
 	if err == nil || !strings.Contains(err.Error(), "empty content") || !strings.Contains(err.Error(), "length") {
 		t.Fatalf("Classify() error = %v, want empty content and finish reason", err)
 	}
@@ -144,7 +146,7 @@ func TestClassifier_RequestBodyUsesStrictJSONSchema(t *testing.T) {
 		t.Fatalf("New() returned error: %v", err)
 	}
 
-	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}, {Name: "other", Description: "Everything else"}})
 	if err != nil {
 		t.Fatalf("Classify() returned error: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestClassifier_ClassifyRetriesOn503(t *testing.T) {
 	}
 	c.client.Transport = throttle.New(nil, 1000, 1, cerebrasClassify)
 
-	result, err := c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	result, err := c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}, {Name: "other", Description: "Everything else"}})
 	if err != nil {
 		t.Fatalf("Classify() returned error: %v", err)
 	}
@@ -191,6 +193,144 @@ func TestClassifier_ClassifyRetriesOn503(t *testing.T) {
 	}
 	if result.Category != "next_steps" || result.Confidence != 0.75 {
 		t.Fatalf("result = %+v, want category next_steps confidence 0.75", result)
+	}
+}
+
+func TestClassifier_ClassifySendsDescriptionsAndAcceptsOther(t *testing.T) {
+	categories := []Category{
+		{Name: "interview", Description: "Invitation to schedule an interview."},
+		{Name: "other", Description: "Anything unrelated to a job search."},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+			ResponseFormat struct {
+				JSONSchema struct {
+					Schema struct {
+						Properties struct {
+							Category struct {
+								Enum []string `json:"enum"`
+							} `json:"category"`
+						} `json:"properties"`
+					} `json:"schema"`
+				} `json:"json_schema"`
+			} `json:"response_format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("Decode() error: %v", err)
+		}
+		if len(payload.Messages) != 1 {
+			t.Fatalf("messages = %d, want 1", len(payload.Messages))
+		}
+		prompt := payload.Messages[0].Content
+		for _, category := range categories {
+			if want := "- " + category.Name + ": " + category.Description; !strings.Contains(prompt, want) {
+				t.Fatalf("prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		enum := payload.ResponseFormat.JSONSchema.Schema.Properties.Category.Enum
+		if strings.Join(enum, ",") != "interview,other" {
+			t.Fatalf("category enum = %v, want [interview other]", enum)
+		}
+
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"category\":\"other\",\"confidence\":0.93}"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	oldURL := cerebrasAPIURL
+	cerebrasAPIURL = server.URL + "/v1/chat/completions"
+	defer func() { cerebrasAPIURL = oldURL }()
+
+	t.Setenv("CEREBRAS_API_KEY", "test-key")
+	c, err := New(context.Background())
+	if err != nil {
+		t.Fatalf("New() returned error: %v", err)
+	}
+
+	result, err := c.Classify(context.Background(), "Weekly newsletter", "news@example.com", "Top stories this week", categories)
+	if err != nil {
+		t.Fatalf("Classify() returned error: %v", err)
+	}
+	if result.Category != "other" || result.Confidence != 0.93 {
+		t.Fatalf("result = %+v, want category other confidence 0.93", result)
+	}
+}
+
+func TestCategoriesFromModels_PreservesNamesAndDescriptions(t *testing.T) {
+	rows := []models.Category{
+		{ID: 1, Name: "confirmation", Description: "Application received."},
+		{ID: 6, Name: "other", Description: "Everything else."},
+	}
+
+	got := CategoriesFromModels(rows)
+	want := []Category{
+		{Name: "confirmation", Description: "Application received."},
+		{Name: "other", Description: "Everything else."},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("category[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildPrompt_DirectsWeakMatchesToOther(t *testing.T) {
+	prompt := buildPrompt("Subject", "sender@example.com", "Body", []Category{
+		{Name: "interview", Description: "Interview scheduling."},
+		{Name: "other", Description: "Anything else."},
+	})
+
+	if !strings.Contains(prompt, `choose "other"`) {
+		t.Fatalf("prompt does not direct weak matches to other:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "closest category anyway") {
+		t.Fatalf("prompt still forces closest category:\n%s", prompt)
+	}
+}
+
+func TestClassifier_ClassifyRequiresOtherCategory(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+	}))
+	defer server.Close()
+
+	oldURL := cerebrasAPIURL
+	cerebrasAPIURL = server.URL + "/v1/chat/completions"
+	defer func() { cerebrasAPIURL = oldURL }()
+
+	t.Setenv("CEREBRAS_API_KEY", "test-key")
+	c, err := New(context.Background())
+	if err != nil {
+		t.Fatalf("New() returned error: %v", err)
+	}
+
+	_, err = c.Classify(context.Background(), "Subject", "sender@example.com", "Hello", []Category{{Name: "next_steps", Description: "Follow-up"}})
+	if !errors.Is(err, ErrMissingOtherCategory) {
+		t.Fatalf("Classify() error = %v, want ErrMissingOtherCategory", err)
+	}
+	if calls != 0 {
+		t.Fatalf("request count = %d, want 0", calls)
+	}
+}
+
+func TestBuildPrompt_FormatsCategoryDescriptions(t *testing.T) {
+	prompt := buildPrompt("Subject", "sender@example.com", "Body", []Category{
+		{Name: "interview", Description: "  Interview scheduling.  "},
+		{Name: "next_steps", Description: ""},
+	})
+
+	if !strings.Contains(prompt, "- interview: Interview scheduling.\n") {
+		t.Fatalf("prompt missing trimmed description line:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "- next_steps\n") || strings.Contains(prompt, "- next_steps:") {
+		t.Fatalf("category without description should be listed without a separator:\n%s", prompt)
 	}
 }
 

@@ -66,7 +66,7 @@ func TestUpsertClassificationOverwritesExistingRow(t *testing.T) {
 	}
 
 	var categoryID int
-	var confidence float64
+	var confidence float32
 	var modelVersion string
 	if err := pool.QueryRow(ctx, `SELECT category_id, confidence, model_version FROM classifications WHERE email_id = $1`, emailID).Scan(&categoryID, &confidence, &modelVersion); err != nil {
 		t.Fatalf("SELECT updated classification: %v", err)
@@ -74,10 +74,49 @@ func TestUpsertClassificationOverwritesExistingRow(t *testing.T) {
 	if categoryID != categories[1].ID {
 		t.Fatalf("expected category_id=%d after update, got %d", categories[1].ID, categoryID)
 	}
-	if confidence != 0.91 {
+	if confidence != float32(0.91) {
 		t.Fatalf("expected confidence=0.91 after update, got %v", confidence)
 	}
 	if modelVersion != "gemini-test-2" {
 		t.Fatalf("expected model_version=gemini-test-2 after update, got %s", modelVersion)
+	}
+}
+
+func TestGetCategoriesIncludesOtherAndDescriptions(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DATABASE_URL is not set; skipping integration test")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	categories, err := NewStore(pool).GetCategories(ctx)
+	if err != nil {
+		t.Fatalf("GetCategories: %v", err)
+	}
+
+	found := map[string]bool{}
+	for _, category := range categories {
+		found[category.Name] = true
+		if category.Description == "" {
+			t.Errorf("category %q has an empty description", category.Name)
+		}
+	}
+	for _, name := range []models.CategoryName{
+		models.CategoryConfirmation,
+		models.CategoryNextSteps,
+		models.CategoryRecruiterReachOut,
+		models.CategoryOnlineAssessment,
+		models.CategoryInterview,
+		models.CategoryOther,
+	} {
+		if !found[string(name)] {
+			t.Errorf("category %q missing from categories table", name)
+		}
 	}
 }
